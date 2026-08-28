@@ -1,0 +1,14 @@
+# Raw FAA exports are ~27 MB per part — never commit these.
+data/raw/
+*.xlsx
+
+# The prepped file is regenerable; commit it only if you want the deployed
+# app to work without running prep_data.py on the host.
+# data/strikes.parquet
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
+.streamlit/secrets.toml
