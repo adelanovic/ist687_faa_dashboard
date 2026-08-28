@@ -289,9 +289,11 @@ with tab_airport:
         st.info("No mappable airports under these filters.")
     else:
         labels = (
-            ap_all["AIRPORT"] + " (" + ap_all["AIRPORT_ID"].astype(str) + ") — "
+            ap_all["AIRPORT"].astype(str)
+            + " (" + ap_all["AIRPORT_ID"].astype(str) + ") — "
             + ap_all["strikes"].astype(str) + " strikes"
         ).tolist()
+        
         pick = st.selectbox("Airport", labels, index=0)
         row = ap_all.iloc[labels.index(pick)]
         sub = fdf[fdf["AIRPORT_ID"] == row["AIRPORT_ID"]]
