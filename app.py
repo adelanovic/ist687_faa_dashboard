@@ -34,48 +34,49 @@ def get_options(_key):
     return core.options(get_data())
 
 
-# Streamlit reruns this whole script on every widget change. At ~350k records
-# the five aggregations below cost about a second combined, which is very
-# noticeable on a checkbox click. Caching them on the filter values makes
-# repeat states instant, and lets the map re-aggregate when only the
-# min-strikes threshold moves without re-running the row filter.
+# Streamlit reruns this whole script on every widget change, so the
+# aggregations below are cached on the sidebar filter values.
 #
-# The cache key is the params tuple, never the DataFrame -- hashing 350k rows
-# would cost more than the work it saves.
+# What is NOT cached is the filtered row subset itself. Caching that was the
+# original design and it caused out-of-memory crashes: one filtered frame is
+# ~110 MB at full scale, so roughly eight distinct year ranges exhausted the
+# ~1 GB container. The aggregates those frames produce total under 3 MB.
+# So: re-filter each rerun (~170 ms, cheap) and cache only the small results.
+#
+# The leading underscore on _fdf tells Streamlit not to hash that argument --
+# hashing 350k rows would cost more than the work it saves. The params tuple
+# is the real cache key, and it fully determines _fdf, so this stays correct.
+#
+# max_entries bounds the cache so a long session cannot grow without limit.
 
-@st.cache_data(show_spinner=False)
-def filtered(params):
-    return core.apply_filters(get_data(), **dict(params))
-
-
-@st.cache_data(show_spinner=False)
-def agg_airports(params, min_strikes):
-    return core.airport_summary(filtered(params), min_strikes=min_strikes)
-
-
-@st.cache_data(show_spinner=False)
-def agg_states(params):
-    return core.state_summary(filtered(params))
-
-
-@st.cache_data(show_spinner=False)
-def agg_species(params, min_strikes):
-    return core.species_summary(filtered(params), min_strikes=min_strikes)
+@st.cache_data(max_entries=32, show_spinner=False)
+def agg_airports(_fdf, params, min_strikes):
+    return core.airport_summary(_fdf, min_strikes=min_strikes)
 
 
-@st.cache_data(show_spinner=False)
-def agg_monthly(params):
-    return core.monthly_series(filtered(params))
+@st.cache_data(max_entries=32, show_spinner=False)
+def agg_states(_fdf, params):
+    return core.state_summary(_fdf)
 
 
-@st.cache_data(show_spinner=False)
-def agg_seasonality(params):
-    return core.seasonality(filtered(params))
+@st.cache_data(max_entries=32, show_spinner=False)
+def agg_species(_fdf, params, min_strikes):
+    return core.species_summary(_fdf, min_strikes=min_strikes)
 
 
-@st.cache_data(show_spinner=False)
-def agg_kpis(params):
-    return core.kpis(filtered(params))
+@st.cache_data(max_entries=32, show_spinner=False)
+def agg_monthly(_fdf, params):
+    return core.monthly_series(_fdf)
+
+
+@st.cache_data(max_entries=32, show_spinner=False)
+def agg_seasonality(_fdf, params):
+    return core.seasonality(_fdf)
+
+
+@st.cache_data(max_entries=32, show_spinner=False)
+def agg_kpis(_fdf, params):
+    return core.kpis(_fdf)
 
 
 try:
@@ -138,7 +139,8 @@ PARAMS = (
     ("known_species_only", known_only),
 )
 
-fdf = filtered(PARAMS)
+# Deliberately uncached: see the note above the agg_ functions.
+fdf = core.apply_filters(get_data(), **dict(PARAMS))
 
 # -------------------------------------------------------------------- head
 st.title("FAA Wildlife Strike Explorer")
@@ -147,7 +149,7 @@ if fdf.empty:
     st.warning("No records match these filters. Widen them in the sidebar.")
     st.stop()
 
-k = agg_kpis(PARAMS)
+k = agg_kpis(fdf, PARAMS)
 c = st.columns(6)
 c[0].metric("Strikes", f"{k['strikes']:,}")
 c[1].metric("Damaging", f"{k['damaging']:,}")
@@ -175,7 +177,7 @@ with tab_map:
         )
         scale = st.slider("Point size", 0.5, 4.0, 1.5, 0.1)
 
-    ap = agg_airports(PARAMS, int(min_strikes))
+    ap = agg_airports(fdf, PARAMS, int(min_strikes))
 
     if ap.empty:
         with left:
@@ -247,7 +249,7 @@ with tab_map:
             st.pydeck_chart(
                 pdk.Deck(layers=[layer], initial_view_state=view,
                          tooltip=tooltip, map_style=style),
-                use_container_width=True,
+                width="stretch",
             )
 
         with right:
@@ -266,7 +268,7 @@ with tab_map:
 
         st.divider()
         st.subheader("Strikes by state")
-        ss = agg_states(PARAMS)
+        ss = agg_states(fdf, PARAMS)
         choro_metric = st.radio(
             "Shade states by", ["Strikes", "Damage rate"],
             horizontal=True, key="choro",
@@ -280,20 +282,21 @@ with tab_map:
             labels={"strikes": "Strikes", "damage_rate": "Damage rate"},
         )
         fig.update_layout(margin=dict(l=0, r=0, t=10, b=0), height=430)
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 # ---------------------------------------------------------- airport detail
 with tab_airport:
-    ap_all = agg_airports(PARAMS, 1)
+    ap_all = agg_airports(fdf, PARAMS, 1)
     if ap_all.empty:
         st.info("No mappable airports under these filters.")
     else:
         labels = (
+            # Both are categorical dtype after core.load(), and pandas refuses
+            # to concatenate a Categorical with a str. Cast before joining.
             ap_all["AIRPORT"].astype(str)
             + " (" + ap_all["AIRPORT_ID"].astype(str) + ") — "
             + ap_all["strikes"].astype(str) + " strikes"
         ).tolist()
-        
         pick = st.selectbox("Airport", labels, index=0)
         row = ap_all.iloc[labels.index(pick)]
         sub = fdf[fdf["AIRPORT_ID"] == row["AIRPORT_ID"]]
@@ -321,7 +324,7 @@ with tab_airport:
                     px.bar(top_sp, x="strikes", y="SPECIES", orientation="h")
                     .update_layout(yaxis=dict(autorange="reversed"),
                                    margin=dict(l=0, r=0, t=10, b=0), height=320),
-                    use_container_width=True,
+                    width="stretch",
                 )
         with b:
             st.markdown("**Strikes by month**")
@@ -333,26 +336,26 @@ with tab_airport:
                 px.bar(x=MONTHS, y=bym.values,
                        labels={"x": "", "y": "Strikes"})
                 .update_layout(margin=dict(l=0, r=0, t=10, b=0), height=320),
-                use_container_width=True,
+                width="stretch",
             )
 
         st.markdown("**Phase of flight**")
         ph = sub["PHASE_OF_FLIGHT"].value_counts()
         ph = ph[ph > 0].rename("strikes").reset_index()
-        st.dataframe(ph, use_container_width=True, hide_index=True)
+        st.dataframe(ph, width="stretch", hide_index=True)
 
         st.markdown("**Recent reports**")
         cols = ["INCIDENT_DATE", "SPECIES", "SIZE", "PHASE_OF_FLIGHT",
                 "DAMAGE_LEVEL", "COST_TOTAL", "REMARKS"]
         st.dataframe(
             sub.sort_values("INCIDENT_DATE", ascending=False)[cols].head(200),
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
 
 # ----------------------------------------------------------------- species
 with tab_species:
     min_sp = st.slider("Minimum strikes to include a species", 5, 500, 25)
-    sp = agg_species(PARAMS, min_sp)
+    sp = agg_species(fdf, PARAMS, min_sp)
     if sp.empty:
         st.info("No species clears that threshold under these filters.")
     else:
@@ -372,7 +375,7 @@ with tab_species:
         )
         fig.update_layout(yaxis_tickformat=".0%", height=520,
                           margin=dict(l=0, r=0, t=10, b=0))
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
         show = sp.copy()
         show["damage_rate"] = (show["damage_rate"] * 100).round(1)
@@ -385,17 +388,17 @@ with tab_species:
                 "size_class": "Size", "cost_total": "Total cost $",
                 "mean_cost_per_strike": "Mean cost/strike $",
             }),
-            use_container_width=True, hide_index=True,
+            width="stretch", hide_index=True,
         )
 
 # ------------------------------------------------------------------ trends
 with tab_trend:
-    ms = agg_monthly(PARAMS)
+    ms = agg_monthly(fdf, PARAMS)
     st.markdown("**Monthly strike counts**")
     fig = px.line(ms, x="month", y=["strikes", "damaging"],
                   labels={"value": "Strikes", "month": "", "variable": ""})
     fig.update_layout(height=340, margin=dict(l=0, r=0, t=10, b=0))
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     st.warning(
         "The long-run rise in reports is partly administrative. FAA wildlife "
@@ -409,7 +412,7 @@ with tab_trend:
     a, b = st.columns(2)
     with a:
         st.markdown("**Seasonality** (mean strikes per calendar month)")
-        se = agg_seasonality(PARAMS)
+        se = agg_seasonality(fdf, PARAMS)
         se = se.copy()
         se["label"] = se["INCIDENT_MONTH"].astype(int).map(
             lambda i: MONTHS[i - 1]
@@ -418,7 +421,7 @@ with tab_trend:
             px.bar(se, x="label", y="strikes",
                    labels={"label": "", "strikes": "Mean strikes"})
             .update_layout(height=330, margin=dict(l=0, r=0, t=10, b=0)),
-            use_container_width=True,
+            width="stretch",
         )
     with b:
         st.markdown("**Damage rate by phase of flight**")
@@ -436,7 +439,7 @@ with tab_trend:
             .update_layout(xaxis_tickformat=".0%", height=330,
                            yaxis=dict(autorange="reversed"),
                            margin=dict(l=0, r=0, t=10, b=0)),
-            use_container_width=True,
+            width="stretch",
         )
 
     st.markdown("**Damage severity mix by bird size**")
@@ -453,7 +456,7 @@ with tab_trend:
                        "DAMAGE_LEVEL": "Damage"})
         .update_layout(yaxis_tickformat=".0%", height=360,
                        margin=dict(l=0, r=0, t=10, b=0)),
-        use_container_width=True,
+        width="stretch",
     )
 
 # ----------------------------------------------------------------- records
@@ -465,7 +468,7 @@ with tab_records:
     cols = [c for c in cols if c in fdf.columns]
     st.dataframe(
         fdf[cols].sort_values("INCIDENT_DATE", ascending=False).head(2000),
-        use_container_width=True, hide_index=True,
+        width="stretch", hide_index=True,
     )
     st.caption("Showing the 2,000 most recent matches.")
     st.download_button(
