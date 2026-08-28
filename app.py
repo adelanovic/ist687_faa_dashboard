@@ -34,6 +34,50 @@ def get_options(_key):
     return core.options(get_data())
 
 
+# Streamlit reruns this whole script on every widget change. At ~350k records
+# the five aggregations below cost about a second combined, which is very
+# noticeable on a checkbox click. Caching them on the filter values makes
+# repeat states instant, and lets the map re-aggregate when only the
+# min-strikes threshold moves without re-running the row filter.
+#
+# The cache key is the params tuple, never the DataFrame -- hashing 350k rows
+# would cost more than the work it saves.
+
+@st.cache_data(show_spinner=False)
+def filtered(params):
+    return core.apply_filters(get_data(), **dict(params))
+
+
+@st.cache_data(show_spinner=False)
+def agg_airports(params, min_strikes):
+    return core.airport_summary(filtered(params), min_strikes=min_strikes)
+
+
+@st.cache_data(show_spinner=False)
+def agg_states(params):
+    return core.state_summary(filtered(params))
+
+
+@st.cache_data(show_spinner=False)
+def agg_species(params, min_strikes):
+    return core.species_summary(filtered(params), min_strikes=min_strikes)
+
+
+@st.cache_data(show_spinner=False)
+def agg_monthly(params):
+    return core.monthly_series(filtered(params))
+
+
+@st.cache_data(show_spinner=False)
+def agg_seasonality(params):
+    return core.seasonality(filtered(params))
+
+
+@st.cache_data(show_spinner=False)
+def agg_kpis(params):
+    return core.kpis(filtered(params))
+
+
 try:
     df = get_data()
 except FileNotFoundError as e:
@@ -80,11 +124,21 @@ with st.sidebar:
         f"{df['INCIDENT_YEAR'].min()}–{df['INCIDENT_YEAR'].max()}"
     )
 
-fdf = core.apply_filters(
-    df, years=years, months=months, states=states, sizes=sizes,
-    phase_groups=phase_groups, phases=phases, times=times, species=species,
-    damage_only=damage_only, known_species_only=known_only,
+# Tuples, not lists: cache keys must be hashable.
+PARAMS = (
+    ("years", tuple(years)),
+    ("months", tuple(months)),
+    ("states", tuple(states)),
+    ("sizes", tuple(sizes)),
+    ("phase_groups", tuple(phase_groups)),
+    ("phases", tuple(phases)),
+    ("times", tuple(times)),
+    ("species", tuple(species)),
+    ("damage_only", damage_only),
+    ("known_species_only", known_only),
 )
+
+fdf = filtered(PARAMS)
 
 # -------------------------------------------------------------------- head
 st.title("FAA Wildlife Strike Explorer")
@@ -93,7 +147,7 @@ if fdf.empty:
     st.warning("No records match these filters. Widen them in the sidebar.")
     st.stop()
 
-k = core.kpis(fdf)
+k = agg_kpis(PARAMS)
 c = st.columns(6)
 c[0].metric("Strikes", f"{k['strikes']:,}")
 c[1].metric("Damaging", f"{k['damaging']:,}")
@@ -121,7 +175,7 @@ with tab_map:
         )
         scale = st.slider("Point size", 0.5, 4.0, 1.5, 0.1)
 
-    ap = core.airport_summary(fdf, min_strikes=int(min_strikes))
+    ap = agg_airports(PARAMS, int(min_strikes))
 
     if ap.empty:
         with left:
@@ -141,7 +195,7 @@ with tab_map:
         # rates and percentages are already bounded, so colour them linearly.
         vals = ap[field].astype(float)
         cvals = np.log1p(vals) if field in ("strikes", "cost_per_strike") else vals
-        ap = ap.assign(_color=core.color_ramp(cvals, reverse=reverse))
+        ap = ap.copy().assign(_color=core.color_ramp(cvals, reverse=reverse))
 
         # Radius from sqrt(count) so area, not radius, tracks volume.
         ap = ap.assign(
@@ -212,7 +266,7 @@ with tab_map:
 
         st.divider()
         st.subheader("Strikes by state")
-        ss = core.state_summary(fdf)
+        ss = agg_states(PARAMS)
         choro_metric = st.radio(
             "Shade states by", ["Strikes", "Damage rate"],
             horizontal=True, key="choro",
@@ -230,7 +284,7 @@ with tab_map:
 
 # ---------------------------------------------------------- airport detail
 with tab_airport:
-    ap_all = core.airport_summary(fdf, min_strikes=1)
+    ap_all = agg_airports(PARAMS, 1)
     if ap_all.empty:
         st.info("No mappable airports under these filters.")
     else:
@@ -254,7 +308,9 @@ with tab_airport:
             st.markdown("**Top species**")
             top_sp = (
                 sub[sub["SPECIES_KNOWN"]]["SPECIES"]
-                .value_counts().head(10).rename("strikes").reset_index()
+                .value_counts()
+                .pipe(lambda x: x[x > 0])  # categorical value_counts keeps zeros
+                .head(10).rename("strikes").reset_index()
             )
             if top_sp.empty:
                 st.caption("No identified species at this airport.")
@@ -279,7 +335,8 @@ with tab_airport:
             )
 
         st.markdown("**Phase of flight**")
-        ph = sub["PHASE_OF_FLIGHT"].value_counts().rename("strikes").reset_index()
+        ph = sub["PHASE_OF_FLIGHT"].value_counts()
+        ph = ph[ph > 0].rename("strikes").reset_index()
         st.dataframe(ph, use_container_width=True, hide_index=True)
 
         st.markdown("**Recent reports**")
@@ -293,7 +350,7 @@ with tab_airport:
 # ----------------------------------------------------------------- species
 with tab_species:
     min_sp = st.slider("Minimum strikes to include a species", 5, 500, 25)
-    sp = core.species_summary(fdf, min_strikes=min_sp)
+    sp = agg_species(PARAMS, min_sp)
     if sp.empty:
         st.info("No species clears that threshold under these filters.")
     else:
@@ -331,7 +388,7 @@ with tab_species:
 
 # ------------------------------------------------------------------ trends
 with tab_trend:
-    ms = core.monthly_series(fdf)
+    ms = agg_monthly(PARAMS)
     st.markdown("**Monthly strike counts**")
     fig = px.line(ms, x="month", y=["strikes", "damaging"],
                   labels={"value": "Strikes", "month": "", "variable": ""})
@@ -350,7 +407,8 @@ with tab_trend:
     a, b = st.columns(2)
     with a:
         st.markdown("**Seasonality** (mean strikes per calendar month)")
-        se = core.seasonality(fdf)
+        se = agg_seasonality(PARAMS)
+        se = se.copy()
         se["label"] = se["INCIDENT_MONTH"].astype(int).map(
             lambda i: MONTHS[i - 1]
         )

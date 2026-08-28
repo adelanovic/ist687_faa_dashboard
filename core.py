@@ -22,6 +22,15 @@ DAMAGE_ORDER = ["No damage", "Minor", "Uncertain", "Substantial", "Destroyed"]
 NON_AIRPORT = {"Unknown", "Private Air Strip", "Remote_Water", "Oil Rig",
                "Unknown Airport"}
 
+# Converted to pandas categoricals on load. All are low-cardinality relative to
+# the row count, so this is a large memory win with no behaviour change.
+CATEGORICAL = [
+    "AIRPORT", "AIRPORT_ID", "STATE", "FAAREGION", "OPERATOR", "AIRCRAFT",
+    "AC_CLASS", "TYPE_ENG", "PHASE_OF_FLIGHT", "PHASE_GROUP", "TIME_OF_DAY",
+    "SKY", "SIZE", "SPECIES", "PRECIPITATION", "EFFECT", "HEIGHT_BAND",
+    "WARNED",
+]
+
 # The STATE column also carries territories and foreign codes. Plotly's
 # "USA-states" mode silently drops unknown codes, but they would still stretch
 # the colour scale, so filter explicitly.
@@ -57,6 +66,16 @@ def load(path=None):
         df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64")
     if df["HAS_COORDS"].dtype == object:
         df["HAS_COORDS"] = df["HAS_COORDS"].astype(str).str.lower().eq("true")
+
+    # Low-cardinality repeated strings dominate memory: at 352k rows the frame
+    # is ~483 MB as objects but ~131 MB as categories, a 73% saving. That is
+    # the difference between fitting and not fitting in Streamlit Community
+    # Cloud's ~1 GB ceiling once the filter cache is also holding subsets.
+    # Every groupby in this module already passes observed=True, which is what
+    # keeps categorical grouping from materialising unused combinations.
+    for c in CATEGORICAL:
+        if c in df.columns:
+            df[c] = df[c].astype("category")
     return df
 
 
